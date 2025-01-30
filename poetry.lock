@@ -1505,6 +1505,20 @@ multidict = ">=4.0"
 propcache = ">=0.2.0"
 
 [[package]]
+name = "zenrows"
+version = "1.4.0"
+description = "Python client for ZenRows API"
+optional = false
+python-versions = ">=3.6"
+files = [
+    {file = "zenrows-1.4.0-py3-none-any.whl", hash = "sha256:61907f95b7cb433e64fb8b95db4cbba062079f3cf18fe06d4a76d452620c8af5"},
+    {file = "zenrows-1.4.0.tar.gz", hash = "sha256:2224ee4b4a285e7ab20883bcb9b4d90df2dcce724a05743ac37167c551bde606"},
+]
+
+[package.dependencies]
+requests = "*"
+
+[[package]]
 name = "zipp"
 version = "3.21.0"
 description = "Backport of pathlib-compatible object wrapper for zip files"
@@ -1526,4 +1540,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "30e0fc9806a6140faaddee6ea9ac5451288f631aa052096369c0774905d02855"
+content-hash = "367a8576c7b87464d7f5b79eb23c20d8f0aa8a29aaf2f886ad834fa9c9f30fae"

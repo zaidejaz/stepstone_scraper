@@ -9,6 +9,10 @@ from datetime import datetime, timedelta
 import re
 import asyncio
 from playwright.async_api import async_playwright
+from zenrows import ZenRowsClient
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Set up logging
 logging.basicConfig(
@@ -17,19 +21,19 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# API Keys (ensure these are loaded from .env file)
-SCRAPING_BEE_API_KEY = ""
-BROWSERCAT_API_KEY = ""
+ZENROWS_API_KEY = os.getenv("ZENROWS_API_KEY" , "")
 
 BASE_URL = "https://www.stepstone.de"
 START_URL = "https://www.stepstone.de/jobs/in-deutschland?radius=5&action=facet_selected%3bage%3bage_1&ag=age_1"
+
+zenrows_client = ZenRowsClient(ZENROWS_API_KEY)
 
 def fetch_with_retry(url, params, retries=3, delay=2):
     """Fetch a URL with retry mechanism."""
     attempt = 0
     while attempt < retries:
         try:
-            response = requests.get(url, params=params)
+            response = zenrows_client.get(url, params=params)
             response.raise_for_status()
             return response
         except requests.exceptions.HTTPError as e:
@@ -41,28 +45,66 @@ def fetch_with_retry(url, params, retries=3, delay=2):
             else:
                 raise e  # Raise non-500 errors
         except Exception as e:
-            logging.error(f"Error occurred: {e}")
+            logging.error(f"Error occurred")
             raise e
     logging.error(f"Failed to fetch {url} after {retries} attempts.")
     return None  # Return None if all retries fail
 
-async def get_job_links(browser, url):
+async def create_browsers(count):
+    """Create multiple browser instances"""
+    scraping_browser = f'wss://browser.zenrows.com?apikey={ZENROWS_API_KEY}'
+    browsers = []
+    playwright = await async_playwright().start()
+    
+    for _ in range(count):
+        browser = await playwright.chromium.connect_over_cdp(scraping_browser)
+        browsers.append(browser)
+    
+    return playwright, browsers
+
+async def process_jobs(job_links, max_concurrent=5):
+    """Process jobs concurrently with a maximum number of concurrent tasks"""
+    semaphore = asyncio.Semaphore(max_concurrent)
+    playwright, browsers = await create_browsers(max_concurrent)
+    
+    logging.info(f"Created {max_concurrent} browser instances")
+    
+    async def process_single_job(job_url, browser_index):
+        """Process a single job with semaphore control"""
+        async with semaphore:
+            try:
+                await scrape_job_listing(browsers[browser_index], job_url)
+            except Exception as e:
+                logging.error(f"Error processing job {job_url}: {str(e)}")
+    
+    try:
+        # Create tasks for all jobs
+        tasks = []
+        for index, job_url in enumerate(job_links):
+            browser_index = index % max_concurrent
+            task = asyncio.create_task(process_single_job(job_url, browser_index))
+            tasks.append(task)
+        
+        # Wait for all tasks to complete
+        await asyncio.gather(*tasks)
+    finally:
+        # Clean up browsers
+        for browser in browsers:
+            await browser.close()
+        await playwright.stop()
+
+async def get_job_links(url):
     job_links = []
     page = 1
-    total_pages = None  # Variable to store total number of pages
+    total_pages = None
     current_url = START_URL + f"&page={page}"
-    
+
     while True:
         try:
             logging.info(f"Fetching page {page}")
-            # Use ScrapingBee API for requests with retry
             response = fetch_with_retry(
-                'https://app.scrapingbee.com/api/v1/',
-                params={
-                    'api_key': SCRAPING_BEE_API_KEY,
-                    'url': current_url,
-                    'render_js': 'false'
-                }
+                current_url,
+                params={"premium_proxy": "true", "proxy_country": "de"}
             )
             
             if not response:
@@ -71,13 +113,11 @@ async def get_job_links(browser, url):
             
             soup = BeautifulSoup(response.text, "html.parser")
             
-            # Extract job links
             links = soup.find_all("a", class_="res-1foik6i")
             new_links = [BASE_URL + link["href"] for link in links if "href" in link.attrs]
             job_links.extend(new_links)
             logging.info(f"Found {len(new_links)} job links on page {page}")
             
-            # Extract total pages on the first iteration
             if total_pages is None:
                 pagination_nav = soup.find('nav', {'aria-label': 'pagination'})
                 if pagination_nav:
@@ -86,26 +126,23 @@ async def get_job_links(browser, url):
                         total_pages = int(last_page_link.text)
                         logging.info(f"Total pages: {total_pages}")
             
-            # Break loop if no more pages or total pages reached
             if total_pages and page >= total_pages:
                 logging.info(f"Reached the last page: {total_pages}")
                 break
 
             logging.info(f"Found {len(job_links)} jobs to scrape")
             
-            # Scrape each job listing
-            for index, job_url in enumerate(job_links, 1):
-                logging.info(f"Processing job {index} of {len(job_links)}")
-                await scrape_job_listing(browser, job_url)
-                # Add a small delay between requests
-                await asyncio.sleep(1)
+            # Process jobs concurrently
+            await process_jobs(job_links)
             
-            # Prepare URL for the next page
+            # Clear job links after processing to avoid processing them again
+            job_links = []
+            
             page += 1
             current_url = START_URL + f"&page={page}"
 
         except Exception as e:
-            logging.error(f"Error occurred while fetching job links: {e}")
+            logging.error(f"Error occurred while fetching job links: {str(e)}")
             break
             
     logging.info(f"Total job links found: {len(job_links)}")
@@ -117,14 +154,10 @@ def get_company_contact_details(company_website):
         contact_url = company_website.replace("/jobs.html", "/kontakte.html#menu")
         logging.info(f"Fetching company contact details from: {contact_url}")
         
-        response = fetch_with_retry(
-            'https://app.scrapingbee.com/api/v1/',
-            params={
-                'api_key': SCRAPING_BEE_API_KEY,
-                'url': contact_url,
-                'render_js': 'false'
-            }
-        )
+        response = response = fetch_with_retry(
+                contact_url,
+                params = {"premium_proxy":"true","proxy_country":"de"}
+            )
         
         if not response:
             logging.warning(f"Skipping contact details for {company_website} due to repeated failures.")
@@ -144,7 +177,7 @@ def get_company_contact_details(company_website):
 
         return website, contact_name, contact_position, contact_phone, contact_email
     except Exception as e:
-        logging.warning(f"Failed to fetch contact details: {e}")
+        logging.warning(f"Failed to fetch contact details")
         return "N/A", "N/A", "N/A", "N/A", "N/A"
 
 async def get_additional_contact_details(page):
@@ -199,10 +232,10 @@ async def get_additional_contact_details(page):
 
             return phone or "N/A", email, website
         except Exception as e:
-            logging.warning(f"Failed to get additional contact details: {e}")
+            logging.warning(f"Failed to get additional contact details")
             return "N/A", "N/A", "N/A"
     except Exception as e:
-        logging.error(f"Error in get_additional_contact_details: {e}")
+        logging.error(f"Error in get_additional_contact_details")
         return "N/A", "N/A", "N/A"
 
 async def scrape_job_listing(browser, url):
@@ -277,7 +310,7 @@ async def scrape_job_listing(browser, url):
         await page.close()
 
     except Exception as e:
-        logging.error(f"Failed to scrape job listing from {url}: {e}")
+        logging.error(f"Failed to scrape job listing from {url} {str(e)}")
         try:
             await page.close()
         except:
@@ -302,28 +335,15 @@ def write_to_csv(data):
             writer.writerow(data)
             logging.info("Successfully wrote data to CSV")
     except Exception as e:
-        logging.error(f"Error writing to CSV: {e}")
+        logging.error(f"Error writing to CSV")
 
 async def main():
     logging.info("Starting the scraping process")
-    
     try:
-        # Connect to BrowserCat with Playwright
-        async with async_playwright() as pw:
-            browser = await pw.chromium.connect(
-                "wss://api.browsercat.com/connect",
-                headers={'Api-Key': BROWSERCAT_API_KEY}
-            )
-            logging.info("Successfully connected to BrowserCat")
-            
-            # Get job links using ScrapingBee
-            await get_job_links(browser, START_URL)
-            
-            await browser.close()
-            logging.info("Scraping process completed")
-            
+        await get_job_links(START_URL)
+        logging.info("Scraping process completed")
     except Exception as e:
-        logging.error(f"Main process error: {e}")
+        logging.error(f"Main process error: {str(e)}")
 
 if __name__ == "__main__":
     asyncio.run(main())
